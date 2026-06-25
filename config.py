@@ -25,10 +25,10 @@ load_dotenv()
 # ============================================================
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "customer_service.db"
+DB_PATH = DATA_DIR / "customer_service.db" # 客户服务数据库
 AUDIT_LOG_PATH = DATA_DIR / "audit_log.jsonl"
 # 退款政策 RAG 的 ChromaDB 存储路径（本项目独立管理，不依赖项目2）
-RAG_CHROMA_PATH = DATA_DIR / "chroma_rag"
+RAG_CHROMA_PATH = DATA_DIR / "chroma_rag" # 退款政策 RAG 的 ChromaDB 存储路径
 
 # 确保数据目录存在
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,24 +53,13 @@ AGENT_CONFIG = {
 }
 
 # ============================================================
-# 工具分级配置
+# 校验规则（已废弃，改用 validation.py 的 Pydantic Model）
+# 保留仅作为备用参考
 # ============================================================
-# 高风险工具：执行前需要用户二次确认
-HIGH_RISK_TOOLS = [
-    "cancel_order",         # 取消订单 — 不可逆操作
-]
-
-# 中等风险工具：记录但不拦截
-MEDIUM_RISK_TOOLS = [
-    "create_ticket",        # 创建工单 — 可撤回但不建议滥用
-]
-
 # ============================================================
-# 校验规则
-# ============================================================
-VALIDATION_RULES = {
+VALIDATION_RULES = { # 对工具参数进行正则表达式校验
     "order_id": {
-        "pattern": r"^ORD-\d{4}$",
+        "pattern": r"^ORD-\d{4}$", # 正则表达式校验订单号格式（ORD-XXXX）
         "example": "ORD-0001",
         "message": "订单号格式应为 ORD-XXXX（4位数字），如 ORD-0001",
     },
@@ -108,5 +97,5 @@ def print_config():
     print(f"  DB: {DB_PATH}")
     print(f"  Audit: {AUDIT_LOG_PATH}")
     print(f"  RAG Chroma: {RAG_CHROMA_PATH}")
-    print(f"  高风险工具: {HIGH_RISK_TOOLS}")
+    print(f"  风险分级: 见 tool_registry.py（Tool dataclass 内聚）")
     print("=" * 60)

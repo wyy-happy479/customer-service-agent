@@ -60,12 +60,14 @@ from typing import Generator
 from openai import OpenAI
 from config import LLM_CONFIG, AGENT_CONFIG
 from tool_registry import (
-    TOOL_DEFINITIONS, TOOL_EXECUTORS,
+    TOOL_EXECUTORS, route_tools,
     execute_high_risk_confirmed,
-    get_risk_level, is_high_risk,
+    get_risk_level, get_permission, requires_confirmation,
 )
 from validation import validate_params
 from audit import audit_logger
+from idempotency import make_idempotency_key, check_and_set, set_result, is_idempotent_tool
+from retry import execute_with_retry, classify_error, ErrorCategory
 
 
 class CustomerServiceAgent:
@@ -230,11 +232,24 @@ class CustomerServiceAgent:
                 print(f"\n📡 [第 {iteration} 次 LLM 调用] "
                       f"上下文 {len(self.messages)} 条消息")
 
+            # ① Tool Routing：根据用户意图缩小工具集
+            #    第一次迭代时做（从最新用户消息中提取意图）
+            if iteration == 1:
+                # 找到最新的 user 消息
+                user_msg = ""
+                for m in reversed(self.messages):
+                    if m["role"] == "user":
+                        user_msg = m["content"]
+                        break
+                routed = route_tools(user_msg, verbose=self.verbose)
+            else:
+                routed = route_tools("", verbose=False)  # 后续迭代发全部（防漏）
+
             # 调 LLM（带 tools）
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=self.messages,
-                tools=TOOL_DEFINITIONS,
+                tools=routed,
                 temperature=LLM_CONFIG["temperature"],
             )
 
@@ -317,7 +332,7 @@ class CustomerServiceAgent:
         """
         执行单个工具调用。
 
-        流程：解析参数 → 校验 → 执行 → 记录审计日志
+        完整流水线：解析参数 → 校验 → 幂等检查 → 重试执行 → 记录审计
         """
         # 1. 解析参数
         try:
@@ -328,38 +343,58 @@ class CustomerServiceAgent:
                 "message": f"工具参数解析失败: {arguments_str}"
             }
 
-        # 2. 参数校验（在真正执行前拦截！）
+        # 2. 参数校验（Pydantic，在真正执行前拦截）
         ok, msg = validate_params(tool_name, params)
         if not ok:
-            # 在这里统一打审计日志，后面的 return 就不打了
             audit_logger.log(
                 tool_name=tool_name, params=params,
                 result={"success": False, "message": msg},
                 duration_ms=0, success=False,
                 risk_level=get_risk_level(tool_name),
+                permission=get_permission(tool_name).value,
             )
             return {"success": False, "message": msg}
 
-        # 3. 查找执行函数
-        executor = TOOL_EXECUTORS.get(tool_name)
-        if executor is None:
-            return {
-                "success": False,
-                "message": f"未知工具: {tool_name}"
-            }
+        # 3. 权限检查（Permission：READ → 直接执行，WRITE/DELETE → 幂等保护）
+        perm = get_permission(tool_name)
+        if self.verbose:
+            print(f"  🔐 权限: {perm.value} | 风险: {get_risk_level(tool_name)}")
 
-        # 4. 执行（计时）
+        # 4. 查找执行函数
+        executor_func = TOOL_EXECUTORS.get(tool_name)
+        if executor_func is None:
+            return {"success": False, "message": f"未知工具: {tool_name}"}
+
+        # 5. 幂等检查（写操作专用）
+        if is_idempotent_tool(tool_name):
+            idempotent_key = make_idempotency_key(tool_name, params)
+            cached = check_and_set(idempotent_key)
+            if cached is not None:
+                if self.verbose:
+                    print(f"  🔁 幂等命中: {idempotent_key} → 返回缓存结果")
+                return cached
+
+        # 6. 执行（带重试 + 计时）
         start = time.time()
         try:
-            result = executor(params)
+            result = execute_with_retry(
+                lambda: executor_func(params),
+                tool_name=tool_name,
+                verbose=self.verbose,
+            )
+        # execute_with_retry 会在可重试错误时自动重试，不可重试时立即返回错误
         except Exception as e:
             result = {
                 "success": False,
-                "message": f"工具执行异常: {str(e)}"
+                "message": f"工具执行异常: {e.__class__.__name__}: {str(e)[:200]}",
             }
         duration = (time.time() - start) * 1000
 
-        # 5. 记录审计日志
+        # 7. 存幂等结果（写操作）
+        if is_idempotent_tool(tool_name) and result.get("success"):
+            set_result(idempotent_key, result)
+
+        # 8. 记录审计日志（含权限信息）
         audit_logger.log(
             tool_name=tool_name,
             params=params,
@@ -367,6 +402,7 @@ class CustomerServiceAgent:
             duration_ms=duration,
             success=result.get("success", False),
             risk_level=get_risk_level(tool_name),
+            permission=get_permission(tool_name).value,
         )
 
         if self.verbose:

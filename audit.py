@@ -55,6 +55,7 @@ class AuditLogger:
         success: bool,
         risk_level: str = "low",
         confirmed_by_user: bool = False,
+        permission: str = "read",
     ):
         """
         写入一条审计日志。
@@ -67,6 +68,7 @@ class AuditLogger:
             success: 是否成功
             risk_level: 风险等级（low/medium/high）
             confirmed_by_user: 高风险操作是否经用户确认
+            permission: 权限层级（read/write/delete/payment）
         """
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -76,6 +78,7 @@ class AuditLogger:
             "duration_ms": round(duration_ms, 2),
             "success": success,
             "risk_level": risk_level,
+            "permission": permission,
             "confirmed_by_user": confirmed_by_user,
         }
 
