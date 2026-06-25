@@ -1,19 +1,19 @@
 # 🤖 多工具智能客服 Agent
 
-基于 Function Calling 的智能客服系统，集成 **6 个工具**（订单查询、物流追踪、退款政策 RAG、工单创建、订单取消），实现 **Agent 循环 + 权限分级 + Human-in-the-Loop + 审计日志**。
+基于 LangChain + OpenAI Function Calling 的智能客服系统，集成 **6 个工具**（订单查询、物流追踪、退款政策 RAG、工单创建、订单取消），实现 **7 项生产级特性**（Tool Routing + 权限分级 + 幂等 + 重试 + Human-in-the-Loop + 审计日志 + 参数校验）。
 
 ---
 
 ## 🎯 功能概览
 
-| 工具 | 功能 | 数据来源 | 风险等级 |
-|------|------|---------|---------|
-| `query_order` | 按订单号查订单详情 | SQLite | 🟢 低 |
-| `query_orders_by_phone` | 按手机号查所有订单 | SQLite | 🟢 低 |
-| `track_logistics` | 查物流进度 + 时间线 | SQLite（模拟） | 🟢 低 |
-| `search_refund_policy` | 退款/退货/换货政策咨询 | ChromaDB RAG | 🟢 低 |
-| `create_ticket` | 创建售后工单 | SQLite | 🟡 中 |
-| `cancel_order` | 取消订单（需二次确认） | SQLite | 🔴 高 |
+| 工具 | 功能 | 数据来源 | 权限 | 风险 |
+|------|------|---------|------|------|
+| `query_order` | 按订单号查订单详情 | SQLite | 📖 read | 🟢 低 |
+| `query_orders_by_phone` | 按手机号查所有订单 | SQLite | 📖 read | 🟢 低 |
+| `track_logistics` | 查物流进度 + 时间线 | SQLite | 📖 read | 🟢 低 |
+| `search_refund_policy` | 退款/退货/换货政策咨询 | ChromaDB RAG | 📖 read | 🟢 低 |
+| `create_ticket` | 创建售后工单 | SQLite | ✍️ write | 🟡 中 |
+| `cancel_order` | 取消订单（需二次确认） | SQLite | 🗑️ delete | 🔴 高 |
 
 ## 🏗 架构
 
@@ -21,25 +21,29 @@
 用户输入
   │
   ▼
-┌──────────────────────────────────────────────────────────┐
-│                  Agent 循环（agent.py）                   │
-│                                                          │
-│  while True:                                             │
-│    ① Tool Routing — 意图分类，缩小工具集（4 个 or 2 个）  │
-│    ② LLM 决策 — 从缩小后的工具集中选一个                  │
-│    ③ 参数校验 — Pydantic Model 声明式校验                 │
-│    ④ 权限检查 — READ/WRITE/DELETE/PAYMENT 四级           │
-│    ⑤ 幂等检查 — 写操作防重复（idempotency key）           │
-│    ⑥ 重试执行 — 可重试错误指数退避，不可重试立即失败      │
-│    ⑦ 审计日志 — JSONL 记录（含权限 + 耗时 + 成功/失败）   │
-│                                                          │
-│    高风险？（DELETE/PAYMENT）→ 等用户输入「确认」          │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    Agent 循环（agent.py）                     │
+│                                                              │
+│  LangChain 负责（调库）：                                     │
+│    ChatOpenAI + bind_tools() → LLM 交互 + Schema 生成        │
+│    @tool 装饰器 → type hints + docstring → Function Calling  │
+│    HumanMessage / ToolMessage → 消息格式标准化               │
+│                                                              │
+│  自定义层负责（生产特性）：                                    │
+│    ① Tool Routing — 意图分类，缩小工具集                     │
+│    ② Pydantic 参数校验                                      │
+│    ③ Permission 检查 — read/write/delete/payment 四级        │
+│    ④ Idempotency — 幂等键防重复操作                          │
+│    ⑤ Retry Policy — tenacity 指数退避，区分可/不可重试       │
+│    ⑥ Human-in-the-Loop — 高风险需用户确认                    │
+│    ⑦ Audit Log — JSONL 全记录                               │
+└──────────────────────────────────────────────────────────────┘
   │
   ▼
 最终回复（自然语言）
+```
 
-**技术栈：** Python + OpenAI SDK（千问百炼 DashScope）+ SQLite + ChromaDB + Pydantic + Streamlit（可选）
+**技术栈：** Python + LangChain + OpenAI SDK（千问 DashScope）+ ChromaDB + SQLite + Pydantic + tenacity + Streamlit（可选）
 
 ## 🚀 快速开始
 
@@ -89,29 +93,29 @@ streamlit run app.py
 
 ```
 03-customer-service-agent/
-├── main.py                  # CLI 入口
-├── app.py                   # Streamlit Web UI（可选）
-├── agent.py                 # ★ 核心引擎：Agent 循环 + 7 项生产特性
-├── tool_registry.py         # 工具注册表（Tool dataclass 内聚全部元数据）
-├── database.py              # SQLite 数据库（订单/物流/工单）
-├── validation.py            # Pydantic 参数校验
-├── idempotency.py           # 幂等机制（防重复操作）
-├── retry.py                 # 重试策略（可重试 vs 不可重试）
-├── audit.py                 # 审计日志（JSONL）
-├── config.py                # 全局配置
-├── requirements.txt         # 依赖清单
-├── .env.example             # 环境变量模板
-├── .gitignore               # Git 忽略规则
-├── README.md                # 本文件
+├── main.py                   # CLI 入口
+├── app.py                    # Streamlit Web UI（可选）
+├── agent.py                  # ★ 核心引擎：LangChain bind_tools + 7 项生产特性
+├── tool_registry.py          # 工具注册表（LangChain @tool 装饰器）
+├── database.py               # SQLite 数据库（订单/物流/工单）
+├── validation.py             # Pydantic 参数校验
+├── idempotency.py            # 幂等机制（防重复操作）
+├── retry.py                  # 重试策略（tenacity 库）
+├── audit.py                  # 审计日志（JSONL）
+├── config.py                 # 全局配置
+├── requirements.txt          # 依赖清单
+├── .env.example              # 环境变量模板
+├── .gitignore                # Git 忽略规则
+├── README.md                 # 本文件
 ├── data/
-│   ├── customer_service.db  # SQLite 数据库文件（自动生成）
-│   ├── audit_log.jsonl      # 审计日志（自动生成）
-│   └── chroma_rag/          # 退款政策 RAG 知识库（首次启动自动构建）
+│   ├── customer_service.db   # SQLite 数据库文件（自动生成）
+│   ├── audit_log.jsonl       # 审计日志（自动生成）
+│   └── chroma_rag/           # 退款政策 RAG 知识库（首次启动自动构建）
 └── tools/
-    ├── order_tools.py       # 订单查询
-    ├── logistics_tools.py   # 物流追踪
-    ├── refund_policy_tools.py # 退款政策 RAG（Chunking + Embedding + ChromaDB 语义搜索）
-    ├── ticket_tools.py      # 工单创建
+    ├── order_tools.py        # 订单查询
+    ├── logistics_tools.py    # 物流追踪
+    ├── refund_policy_tools.py # 退款政策 RAG (LangChain RecursiveTextSplitter + MultiQueryRetriever)
+    ├── ticket_tools.py       # 工单创建
     └── cancel_order_tools.py # 取消订单（高风险确认）
 ```
 
@@ -130,16 +134,16 @@ python main.py --once "我手机号13800138001，帮我查我的订单"
 # 4. 多工具联动（先查订单再查物流）
 python main.py --once "我手机13800138001，帮我查最近那个订单的物流"
 
-# 5. 退款政策 RAG（语义搜索）
+# 5. 退款政策 RAG（语义搜索 + MultiQueryRetriever 多角度变体）
 python main.py --once "我想退货，有什么条件？"
 
-# 6. 口语化政策查询（测试语义理解）
+# 6. 口语化政策查询（测试语义理解 + Query Rewrite）
 python main.py --once "我刚买了双鞋穿着小了想换个大的，怎么操作？"
 
 # 7. 创建售后工单
 python main.py --once "ORD-0004收到的东西坏了，我要投诉"
 
-# 8. 参数校验（非法订单号会被拦截）
+# 8. 参数校验（非法订单号会被 Pydantic 拦截）
 python main.py --once "帮我查订单号是abc的订单"
 
 # 9. 审计日志
@@ -159,16 +163,56 @@ python main.py --audit
   "duration_ms": 12.5,
   "success": true,
   "risk_level": "low",
+  "permission": "read",
   "confirmed_by_user": false
 }
 ```
 
 ## 🔑 核心设计决策
 
-### ① Tool Selection + Tool Routing（工具太多时模型容易选错）
+### ① 工具定义：LangChain @tool 装饰器 → 自动生成 Function Calling Schema
 
-6 个工具不算多，但当工具数量增长到 20+ 时，LLM 的语义选择准确率会明显下降。
-解法：先用关键词匹配判断用户意图（QUERY 还是 ACTION），只发对应类别的工具给 LLM。
+```python
+# type hints + docstring → LLM 看到的 JSON Schema，不用手写 dict
+@tool
+def query_order(order_id: Annotated[str, "订单号，如 ORD-0001"]) -> str:
+    """根据订单号查询单个订单的详细信息。"""
+    ...
+
+# 面试话术：
+# "工具定义我用 LangChain 的 @tool 装饰器，type hints + docstring 自动生成
+#  Function Calling JSON Schema，不用手写 parameters dict。这是标准生产模式。"
+```
+
+### ② Agent 循环：ChatOpenAI.bind_tools() → 自动处理消息格式
+
+```python
+llm = ChatOpenAI(model="qwen-plus", ...)
+llm_with_tools = llm.bind_tools(tools)     # LangChain 自动注入 tool schemas
+response = llm_with_tools.invoke(messages)  # 自动处理 tool_call 解析
+```
+
+不用手写 `client.chat.completions.create(messages=..., tools=...)` 和 JSON 解析。
+
+### ③ RAG：LangChain RecursiveCharacterTextSplitter + MultiQueryRetriever
+
+- **Chunking**：用 `RecursiveCharacterTextSplitter`（不用手写递归切分）
+- **检索**：用 `MultiQueryRetriever` → LLM 生成多个变体 → 多路搜索 → 去重合并
+- **Query Rewrite**：用 LangChain `ChatPromptTemplate | LLM | StrOutputParser` 管道
+
+### ④ Retry：tenacity 库（Python 最成熟的重试库）
+
+```python
+retry_decorator = retry(
+    retry=retry_if_exception(_is_retryable),         # 白名单策略
+    stop=stop_after_attempt(3),                       # 最多 3 次
+    wait=wait_exponential(multiplier=1, max=10),      # 指数退避 1s→2s→4s
+)
+```
+
+不重复造轮子。可重试错误白名单：网络超时 / 503 / 限流 → 重试；参数错误 / 余额不足 → 立即失败。
+
+### ⑤ Tool Routing（意图分类缩小工具集）
 
 ```
 "查一下 ORD-0001" → 只发 4 个查询工具（精准）
@@ -176,66 +220,39 @@ python main.py --audit
 "你好"          → 发全部 6 个（防误杀）
 ```
 
-优势：零 LLM 调用成本、确定性路由、不会误杀（意图不明时兜底发全部）。
-
-### ② Permission（读/写/删/支付 四级权限）
-
-每个 Tool 声明自己的 `PermissionLevel`，执行时系统统一检查：
+### ⑥ Permission（读/写/删/支付 四级权限）
 
 | 权限 | 示例工具 | 执行策略 |
 |------|---------|---------|
-| 📖 READ | query_order, track_logistics | 直接执行 |
-| ✍️ WRITE | create_ticket | 幂等保护 + 可重试 |
-| 🗑️ DELETE | cancel_order | 需用户二次确认 |
-| 💰 PAYMENT | （预留） | 需用户二次确认 + 金融级幂等 |
+| 📖 read | query_order, track_logistics | 直接执行 |
+| ✍️ write | create_ticket | 幂等保护 + 可重试 |
+| 🗑️ delete | cancel_order | 需用户二次确认 |
+| 💰 payment | （预留） | 需二次确认 + 金融级幂等 |
 
-权限不是 if/else 硬编码，而是 Tool 的元数据——加新工具不需要改 agent.py。
+### ⑦ Human-in-the-Loop + Idempotency
 
-### ③ Idempotency（幂等 — 避免重复扣款/重复下单）
-
-写操作自动携带幂等键（MD5(tool_name + params)），执行前检查：
-- 幂等键未命中 → 正常执行 + 存结果
-- 幂等键命中 → 直接返回缓存结果（不重复执行）
-
-解决：网络超时后用户重试导致重复创建工单的问题。
-
-### ④ Retry Policy（区分可重试和不可重试错误）
-
-不是所有错误都适合重试：
-
-| 错误类型 | 策略 | 示例 |
-|---------|------|------|
-| 🔄 可重试 | 指数退避，最多 3 次 | 网络超时、503 服务不可用 |
-| ⛔ 不可重试 | 立即返回错误 | 参数校验失败、余额不足 |
-
-使用白名单策略——只有明确列为可重试的错误才重试，其余一律立即失败。
-
-### ⑤ Human-in-the-Loop（高风险需用户确认）
-
-DELETE/PAYMENT 级别的工具执行前返回确认提示 → 等待用户输入"确认"→ 才真正执行。
-LLM 可能误判意图，"我想取消"不一定是真的要取消。
-
-### ⑥ Audit Log（记录工具名、参数、结果、耗时、权限、用户授权）
-
-JSONL 格式，每条记录包含：timestamp, tool_name, params, result, duration_ms, success, risk_level, permission, confirmed_by_user。
-
-### ⑦ 参数校验（Pydantic）
-
-用 Pydantic Model 做声明式校验，和项目 1 结构化输出用同一工具链。每个工具的参数是一个 Pydantic class，类型 + 格式 + 必填一次定义。
+- 高风险操作 → 暂停 → 用户输入"确认" → 才执行
+- 写操作 → 幂等键 = MD5(tool_name + params) → 命中则返回缓存结果
 
 ---
 
-## 📝 简历写法
+## 📝 面试话术速查
 
-> **多工具智能客服 Agent**
-> - 基于 OpenAI Function Calling 实现 6 工具 Agent，覆盖订单查询、物流追踪、工单创建、政策咨询全场景
-> - 自研 RAG 链路（Chunking + Embedding + ChromaDB 语义检索），千问 text-embedding-v3 向量化，支持口语化政策查询
-> - 实现 Human-in-the-Loop 高风险确认 + Pydantic 参数校验 + JSONL 审计日志（Tool Call Trace）
-> - 支持 CLI 和 Streamlit 双入口，Agent 循环内 LLM 自主决策工具调用策略
+| 模块 | 怎么说 |
+|------|--------|
+| **工具定义** | 用 LangChain `@tool` 装饰器，type hints + docstring 自动生成 Function Calling Schema |
+| **Agent 循环** | `ChatOpenAI.bind_tools()` + `invoke()`，LangChain 做 LLM 交互 + 消息格式；自己封装 Tool Routing / 幂等 / 重试 / 审计 |
+| **RAG** | `RecursiveCharacterTextSplitter` 切分 + `MultiQueryRetriever` 多角度变体搜索 + `ChatPromptTemplate` pipe 做 Query Rewrite |
+| **重试** | `tenacity` 库，白名单策略 + 指数退避，不是所有错误都重试 |
+| **幂等** | 写操作自动带幂等键，网络超时重试不会重复创建 |
+| **权限** | 每个工具的元数据声明 permission level，执行时系统统一检查 |
+| **审计** | JSONL 格式全量记录 tool_name / params / result / duration / permission / confirmed |
 
 ## 📚 延伸阅读
 
 - 项目 1（`works/01project`）— 结构化信息抽取，Pydantic Schema 校验
 - 项目 2（`works/rag-knowledge-base`）— 完整 RAG 知识库（混合检索 + Rerank + 评估）
-- OpenAI Function Calling 文档：https://platform.openai.com/docs/guides/function-calling
+- LangChain @tool 文档：https://python.langchain.com/docs/how_to/custom_tools/
+- LangChain bind_tools 文档：https://python.langchain.com/docs/how_to/tool_calling/
+- tenacity 文档：https://tenacity.readthedocs.io/
 - Pydantic v2 文档：https://docs.pydantic.dev/latest/

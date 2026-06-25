@@ -1,104 +1,66 @@
 """
-Agent 循环 — 核心引擎
+Agent 核心引擎 — LangChain ChatOpenAI.bind_tools() + 自定义生产特性
 
-📖 核心概念：
-    Agent 循环就是让 LLM 反复"思考→行动→观察→思考→..."直到得出最终答案。
-    这跟人类解决问题的方式一样：想一步，做一步，看结果，再想下一步。
+📖 架构：
 
-🔍 底层原理（跟着数字走）：
+    LangChain 负责（调库）：
+    - LLM 交互 — ChatOpenAI
+    - 工具 Schema — @tool 装饰器
+    - Tool Binding — llm.bind_tools()（自动生成 Function Calling 参数）
+    - 消息格式 — HumanMessage / AIMessage / ToolMessage
 
-    用户: "我的订单 ORD-0001 到哪了？"
-      │
-      ▼
-    ┌──────────────────────────────────────────────────────┐
-    │  第 1 次 LLM 调用（带 tools）                          │
-    │  LLM 想：用户想知道物流 → 我应该调 track_logistics      │
-    │  LLM 返回：tool_calls=[{name:"track_logistics",        │
-    │              arguments:{order_id:"ORD-0001"}}]         │
-    └──────────────────────────────────────────────────────┘
-      │
-      ▼
-    ┌──────────────────────────────────────────────────────┐
-    │  你的代码：执行工具                                     │
-    │  → 查物流表 → 返回：快递在"北京分拣中心"               │
-    └──────────────────────────────────────────────────────┘
-      │
-      ▼
-    ┌──────────────────────────────────────────────────────┐
-    │  第 2 次 LLM 调用（带 tools + 工具结果）                │
-    │  LLM 看：工具拿到了物流信息，信息够了，不需要再调工具     │
-    │  LLM 返回：stop → "您的订单当前在北京分拣中心..."       │
-    └──────────────────────────────────────────────────────┘
-      │
-      ▼
-    最终回复给用户
+    自定义层负责（LangChain 不原生支持的生产特性）：
+    - Tool Routing（意图分类缩小工具集）
+    - Permission 检查（read/write/delete/payment）
+    - Idempotency（幂等键 + 重复检测）
+    - Retry Policy（tenacity 指数退避）
+    - Human-in-the-Loop（高风险操作等用户确认）
+    - Audit Log（JSONL 全记录）
+    - 参数校验（Pydantic）
 
-💡 Human-in-the-Loop 流程：
+🔍 bind_tools() vs create_tool_calling_agent()：
 
-    用户: "帮我取消 ORD-0003"
-      │
-      ▼
-    LLM 决定调 cancel_order("ORD-0003")
-      │
-      ▼
-    你的代码：检测到 requires_confirmation → 暂停！
-    → 输出确认提示 → 等待用户输入
-      │
-      ├── 用户输入"确认" → 真正执行 cancel_order → 返回结果给 LLM
-      └── 用户输入其他 → 放弃操作 → 告诉 LLM "用户取消了"
+    bind_tools() 是 LangChain 最底层的原语——它把 @tool 对象转成 OpenAI
+    Function Calling 格式，自动注入到 ChatOpenAI 的请求中。所有版本的
+    LangChain 都支持。
 
-⚠️ 常见坑点：
-    1. message 格式必须严格正确（role、tool_call_id、tool_calls 结构）
-       → 格式错了 OpenAI API 会返回 400 错误
-    2. 不要把工具结果当最终答案（必须再调一次 LLM 转成人话）
-    3. max_iterations 必须设上限（防止 LLM 死循环）
+    create_tool_calling_agent() 是高级封装——内部也是 bind_tools + prompt
+    template + output parser。但它在 langchain 1.3+ 中不存在了。
+
+    面试话术：
+    "我用 LangChain 的 ChatOpenAI.bind_tools() 绑定工具，这是最标准的模式。
+    在此基础上封装了生产必需的 Human-in-the-Loop、幂等、重试等横切逻辑。"
 """
 
 import json
 import time
-from typing import Generator
-from openai import OpenAI
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
+
 from config import LLM_CONFIG, AGENT_CONFIG
 from tool_registry import (
-    TOOL_EXECUTORS, route_tools,
-    execute_high_risk_confirmed,
-    get_risk_level, get_permission, requires_confirmation,
+    ALL_TOOLS, TOOLS_BY_NAME, route_tools,
+    get_permission, get_risk_level, get_high_risk_executor,
 )
 from validation import validate_params
 from audit import audit_logger
 from idempotency import make_idempotency_key, check_and_set, set_result, is_idempotent_tool
-from retry import execute_with_retry, classify_error, ErrorCategory
+from retry import execute_with_retry
 
 
-class CustomerServiceAgent:
-    """
-    多工具智能客服 Agent。
+# ═══════════════════════════════════════════════════════════
+# LangChain LLM（只创建一次）
+# ═══════════════════════════════════════════════════════════
 
-    使用方式：
-        agent = CustomerServiceAgent()
-        agent.chat("我的订单 ORD-0001 到哪了？")
-    """
+_llm = ChatOpenAI(
+    model=LLM_CONFIG["model"],
+    openai_api_key=LLM_CONFIG["api_key"],
+    openai_api_base=LLM_CONFIG["base_url"],
+    temperature=LLM_CONFIG["temperature"],
+)
 
-    def __init__(self):
-        self.client = OpenAI(
-            api_key=LLM_CONFIG["api_key"],
-            base_url=LLM_CONFIG["base_url"],
-        )
-        self.model = LLM_CONFIG["model"]
-        self.max_iterations = AGENT_CONFIG["max_iterations"]
-        self.verbose = AGENT_CONFIG["verbose"]
-
-        # 对话历史（整个会话期间持续累积）
-        self.messages: list[dict] = [
-            {
-                "role": "system",
-                "content": self._build_system_prompt()
-            }
-        ]
-
-    def _build_system_prompt(self) -> str:
-        """构建 system prompt — 告诉 LLM 它是谁、能做什么、规则是什么"""
-        return """你是一个专业的电商客服助手。你可以帮用户：
+SYSTEM_PROMPT = """你是一个专业的电商客服助手。你可以帮用户：
 
 1. **查订单** — 用户提供订单号（ORD-XXXX）或手机号，帮他们查订单详情
 2. **查物流** — 用户提供订单号，帮他们追踪快递进度
@@ -115,274 +77,175 @@ class CustomerServiceAgent:
 - 当信息足够回答用户问题时，不要再调用更多工具，直接回答
 - 如果用户只是闲聊（打招呼、感谢等），直接友好回应，不要调工具"""
 
+
+# ═══════════════════════════════════════════════════════════
+# CustomerServiceAgent
+# ═══════════════════════════════════════════════════════════
+
+class CustomerServiceAgent:
+    """多工具智能客服 Agent — LangChain bind_tools + 生产特性"""
+
+    def __init__(self):
+        self.max_iterations = AGENT_CONFIG["max_iterations"]
+        self.verbose = AGENT_CONFIG["verbose"]
+        self.messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+        self._pending_confirmation: dict | None = None
+
     def chat(self, user_message: str) -> str:
-        """
-        处理一条用户消息，返回 Agent 的最终回复。
-
-        这是完整的三阶段流程：
-        1. Agent 循环（LLM 自主调工具）
-        2. 高风险确认（如需要）
-        3. 最终回复生成
-        """
-        # 用户消息加入对话历史
-        self.messages.append({"role": "user", "content": user_message})
-
-        # ═══════════════════════════════════════════════
-        # 阶段 1：Agent 循环
-        # ═══════════════════════════════════════════════
-        loop_result = self._agent_loop()
-
-        # ═══════════════════════════════════════════════
-        # 阶段 2：如果 LLM 返回了最终答案，直接返回
-        # ═══════════════════════════════════════════════
-        if loop_result["type"] == "final_answer":
-            return loop_result["content"]
-
-        # ═══════════════════════════════════════════════
-        # 阶段 3：高风险确认（如果需要）
-        # ═══════════════════════════════════════════════
-        if loop_result["type"] == "needs_confirmation":
-            # 返回确认提示，等待外部处理
-            return loop_result["confirmation_message"]
-
-        # 兜底
-        return "抱歉，我暂时无法处理您的请求，请稍后重试或联系人工客服。"
+        result = self._run(user_message)
+        if result["type"] == "final_answer":
+            return result["content"]
+        if result["type"] == "needs_confirmation":
+            return result["confirmation_message"]
+        return "抱歉，我暂时无法处理您的请求，请稍后重试。"
 
     def confirm_high_risk(self, confirmed: bool) -> str:
-        """
-        用户对高风险操作的确认结果。
-
-        Args:
-            confirmed: True=确认执行, False=放弃
-
-        调用时机：chat() 返回确认提示后，用户输入"确认"或"取消"时调用。
-        """
-        if not hasattr(self, '_pending_confirmation'):
+        if not self._pending_confirmation:
             return "没有待确认的操作。"
 
         pending = self._pending_confirmation
-
         if not confirmed:
-            # 用户放弃 → 把"用户放弃"作为工具结果返回给 LLM
             self._append_tool_result(
                 pending["tool_call_id"],
-                json.dumps({
-                    "success": False,
-                    "message": "用户取消了该操作，未执行。",
-                }, ensure_ascii=False)
-            )
+                json.dumps({"success": False, "message": "用户取消了操作"}, ensure_ascii=False))
             self._pending_confirmation = None
+            result = self._run("")
+            return result.get("content", "操作已取消。")
 
-            # 重新进入 Agent 循环，让 LLM 根据"用户取消"生成回复
-            result = self._agent_loop()
-            if result["type"] == "final_answer":
-                return result["content"]
-            return "操作已取消。请问还有其他需要帮您的吗？"
+        tool_name = pending["tool_name"]
+        params = pending["params"]
+        if self.verbose:
+            print(f"\n  ✅ 用户已确认，执行: {tool_name}")
 
-        else:
-            # 用户确认 → 真正执行
-            tool_name = pending["tool_name"]
-            params = pending["params"]
+        start = time.time()
+        executor = get_high_risk_executor(tool_name)
+        result = executor(params) if executor else {"success": False, "message": f"无确认函数: {tool_name}"}
+        duration = (time.time() - start) * 1000
 
-            if self.verbose:
-                print(f"\n  ✅ 用户已确认，执行高风险操作: {tool_name}")
+        audit_logger.log(
+            tool_name=tool_name, params=params, result=result,
+            duration_ms=duration, success=result.get("success", False),
+            risk_level=get_risk_level(tool_name),
+            permission=get_permission(tool_name), confirmed_by_user=True,
+        )
+        self._append_tool_result(pending["tool_call_id"],
+                                 json.dumps(result, ensure_ascii=False))
+        self._pending_confirmation = None
+        result = self._run("")
+        return result.get("content", json.dumps(result, ensure_ascii=False))
 
-            start = time.time()
-            result = execute_high_risk_confirmed(tool_name, params)
-            duration = (time.time() - start) * 1000
+    # ═══════════════════════════════════════════════════════
+    # 核心循环
+    # ═══════════════════════════════════════════════════════
 
-            # 记录审计日志（标记为已确认）
-            audit_logger.log(
-                tool_name=tool_name,
-                params=params,
-                result=result,
-                duration_ms=duration,
-                success=result.get("success", False),
-                risk_level="high",
-                confirmed_by_user=True,
-            )
+    def _run(self, user_message: str) -> dict:
+        """Agent 主循环 — llm.bind_tools() 替代手写 tools 参数 + messages 拼接"""
 
-            # 把结果返回给 LLM
-            self._append_tool_result(
-                pending["tool_call_id"],
-                json.dumps(result, ensure_ascii=False)
-            )
-            self._pending_confirmation = None
+        # Tool Routing + bind_tools（LangChain 自动生成 Function Calling schema）
+        routed = route_tools(user_message, verbose=self.verbose) if user_message else ALL_TOOLS
+        llm = _llm.bind_tools(routed)
 
-            # 重新进入 Agent 循环
-            loop_result = self._agent_loop()
-            if loop_result["type"] == "final_answer":
-                return loop_result["content"]
-            return json.dumps(result, ensure_ascii=False)
+        # RAG 上下文注入
+        from tools.refund_policy_tools import set_search_context
+        ctx = []
+        for m in self.messages[-6:]:
+            content = getattr(m, 'content', '') or ''
+            if hasattr(m, 'type'):
+                ctx.append(f"{m.type.upper()}: {content[:200]}")
+        set_search_context("\n".join(ctx))
 
-    # ═══════════════════════════════════════════════
-    # 内部方法
-    # ═══════════════════════════════════════════════
+        if user_message:
+            self.messages.append(HumanMessage(content=user_message))
 
-    def _agent_loop(self) -> dict:
-        """
-        Agent 主循环：反复调 LLM → 执行工具 → 再调 LLM → ...直到 LLM 说 stop。
-
-        Returns:
-            {"type": "final_answer", "content": "..."}   — LLM 给出最终回复
-            {"type": "needs_confirmation", "confirmation_message": "..."} — 需要用户确认
-        """
         for iteration in range(1, self.max_iterations + 1):
             if self.verbose:
                 print(f"\n📡 [第 {iteration} 次 LLM 调用] "
-                      f"上下文 {len(self.messages)} 条消息")
+                      f"{len(self.messages)} 条消息, {len(routed)} 个工具")
 
-            # ① Tool Routing：根据用户意图缩小工具集
-            #    第一次迭代时做（从最新用户消息中提取意图）
-            if iteration == 1:
-                # 找到最新的 user 消息
-                user_msg = ""
-                for m in reversed(self.messages):
-                    if m["role"] == "user":
-                        user_msg = m["content"]
-                        break
-                routed = route_tools(user_msg, verbose=self.verbose)
-            else:
-                routed = route_tools("", verbose=False)  # 后续迭代发全部（防漏）
+            # LangChain llm.invoke() — 自动 handle tool schemas + 消息格式
+            response = llm.invoke(self.messages)
 
-            # 调 LLM（带 tools）
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=routed,
-                temperature=LLM_CONFIG["temperature"],
-            )
-
-            choice = response.choices[0]
-
-            # ── 情况 A：LLM 觉得信息够了，直接回答 ──
-            if choice.finish_reason == "stop":
-                content = choice.message.content or ""
-                self.messages.append({"role": "assistant", "content": content})
+            # 无 tool_calls → final answer
+            if not response.tool_calls:
+                self.messages.append(response)
                 if self.verbose:
-                    print(f"  ✅ LLM 决定：stop（回答用户）")
-                return {"type": "final_answer", "content": content}
+                    print(f"  ✅ LLM 决定：stop")
+                return {"type": "final_answer",
+                        "content": response.content or ""}
 
-            # ── 情况 B：LLM 想调工具 ──
-            if choice.finish_reason == "tool_calls":
-                if self.verbose:
-                    for tc in choice.message.tool_calls:
-                        print(f"  🔧 LLM 想调: {tc.function.name}"
-                              f"({tc.function.arguments})")
-
-                # ① 把 assistant 消息写入对话历史
-                self.messages.append({
-                    "role": "assistant",
-                    "content": choice.message.content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            }
-                        }
-                        for tc in choice.message.tool_calls
-                    ]
-                })
-
-                # ② 逐个执行工具
-                for tc in choice.message.tool_calls:
-                    result = self._execute_single_tool(
-                        tool_call_id=tc.id,
-                        tool_name=tc.function.name,
-                        arguments_str=tc.function.arguments,
-                    )
-
-                    # 检查是否需要高风险确认
-                    if result.get("requires_confirmation"):
-                        # 暂停 Agent 循环，等用户确认
-                        self._pending_confirmation = {
-                            "tool_call_id": tc.id,
-                            "tool_name": tc.function.name,
-                            "params": json.loads(tc.function.arguments),
-                        }
-                        return {
-                            "type": "needs_confirmation",
-                            "confirmation_message": result["message"],
-                        }
-
-                    # 正常工具结果 → 写入对话历史
-                    self._append_tool_result(
-                        tc.id, json.dumps(result, ensure_ascii=False))
-
-                # ③ 继续循环（LLM 可能还需要调更多工具）
-                continue
-
-            # ── 情况 C：其他（异常） ──
+            # ── 有 tool_calls → 逐个执行 ──
             if self.verbose:
-                print(f"  ⚠️ 意外的 finish_reason: {choice.finish_reason}")
-            break
+                for tc in response.tool_calls:
+                    print(f"  🔧 LLM 想调: {tc['name']}({tc['args']})")
 
-        # 超过最大迭代次数
-        return {
-            "type": "final_answer",
-            "content": "抱歉，处理您的请求耗时较长，请稍后重试或联系人工客服。"
-        }
+            self.messages.append(response)
 
-    def _execute_single_tool(
-        self, tool_call_id: str, tool_name: str, arguments_str: str
-    ) -> dict:
-        """
-        执行单个工具调用。
+            for tc in response.tool_calls:
+                result = self._execute_tool(tc["name"], tc["args"])
 
-        完整流水线：解析参数 → 校验 → 幂等检查 → 重试执行 → 记录审计
-        """
-        # 1. 解析参数
-        try:
-            params = json.loads(arguments_str)
-        except json.JSONDecodeError:
-            return {
-                "success": False,
-                "message": f"工具参数解析失败: {arguments_str}"
-            }
+                if result.get("requires_confirmation"):
+                    self._pending_confirmation = {
+                        "tool_call_id": tc["id"],
+                        "tool_name": tc["name"],
+                        "params": tc["args"],
+                    }
+                    return {
+                        "type": "needs_confirmation",
+                        "confirmation_message": result["message"],
+                    }
 
-        # 2. 参数校验（Pydantic，在真正执行前拦截）
-        ok, msg = validate_params(tool_name, params)
+                self._append_tool_result(
+                    tc["id"], json.dumps(result, ensure_ascii=False))
+
+            continue
+
+        return {"type": "final_answer",
+                "content": "抱歉，处理您的请求耗时较长，请稍后重试。"}
+
+    # ═══════════════════════════════════════════════════════
+    # 工具执行流水线（Pydantic → 权限 → 幂等 → tenacity 重试 → 审计）
+    # ═══════════════════════════════════════════════════════
+
+    def _execute_tool(self, tool_name: str, args: dict) -> dict:
+        # ① Pydantic 参数校验
+        ok, msg = validate_params(tool_name, args)
         if not ok:
             audit_logger.log(
-                tool_name=tool_name, params=params,
+                tool_name=tool_name, params=args,
                 result={"success": False, "message": msg},
                 duration_ms=0, success=False,
                 risk_level=get_risk_level(tool_name),
-                permission=get_permission(tool_name).value,
+                permission=get_permission(tool_name),
             )
             return {"success": False, "message": msg}
 
-        # 3. 权限检查（Permission：READ → 直接执行，WRITE/DELETE → 幂等保护）
-        perm = get_permission(tool_name)
+        # ② 权限日志
         if self.verbose:
-            print(f"  🔐 权限: {perm.value} | 风险: {get_risk_level(tool_name)}")
+            print(f"  🔐 权限: {get_permission(tool_name)} | "
+                  f"风险: {get_risk_level(tool_name)}")
 
-        # 4. 查找执行函数
-        executor_func = TOOL_EXECUTORS.get(tool_name)
-        if executor_func is None:
-            return {"success": False, "message": f"未知工具: {tool_name}"}
-
-        # 5. 幂等检查（写操作专用）
+        # ③ 幂等检查
+        idempotent_key = None
         if is_idempotent_tool(tool_name):
-            idempotent_key = make_idempotency_key(tool_name, params)
+            idempotent_key = make_idempotency_key(tool_name, args)
             cached = check_and_set(idempotent_key)
             if cached is not None:
                 if self.verbose:
-                    print(f"  🔁 幂等命中: {idempotent_key} → 返回缓存结果")
+                    print(f"  🔁 幂等命中: {idempotent_key}")
                 return cached
 
-        # 6. 执行（带重试 + 计时）
+        # ④ 执行（LangChain tool.invoke + tenacity 重试）
+        langchain_tool = TOOLS_BY_NAME.get(tool_name)
+        if langchain_tool is None:
+            return {"success": False, "message": f"未知工具: {tool_name}"}
+
         start = time.time()
         try:
-            result = execute_with_retry(
-                lambda: executor_func(params),
-                tool_name=tool_name,
-                verbose=self.verbose,
+            result_raw = execute_with_retry(
+                lambda: langchain_tool.invoke(args),
+                tool_name=tool_name, verbose=self.verbose,
             )
-        # execute_with_retry 会在可重试错误时自动重试，不可重试时立即返回错误
+            result = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
         except Exception as e:
             result = {
                 "success": False,
@@ -390,19 +253,16 @@ class CustomerServiceAgent:
             }
         duration = (time.time() - start) * 1000
 
-        # 7. 存幂等结果（写操作）
-        if is_idempotent_tool(tool_name) and result.get("success"):
+        # ⑤ 存幂等结果
+        if idempotent_key and result.get("success"):
             set_result(idempotent_key, result)
 
-        # 8. 记录审计日志（含权限信息）
+        # ⑥ 审计日志
         audit_logger.log(
-            tool_name=tool_name,
-            params=params,
-            result=result,
-            duration_ms=duration,
-            success=result.get("success", False),
+            tool_name=tool_name, params=args, result=result,
+            duration_ms=duration, success=result.get("success", False),
             risk_level=get_risk_level(tool_name),
-            permission=get_permission(tool_name).value,
+            permission=get_permission(tool_name),
         )
 
         if self.verbose:
@@ -412,25 +272,14 @@ class CustomerServiceAgent:
         return result
 
     def _append_tool_result(self, tool_call_id: str, content: str):
-        """把工具执行结果追加到对话历史"""
-        self.messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": content,
-        })
+        self.messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
 
     def reset(self):
-        """重置对话历史（开始新会话）"""
-        self.messages = [
-            {"role": "system", "content": self._build_system_prompt()}
-        ]
-        if hasattr(self, '_pending_confirmation'):
-            del self._pending_confirmation
+        self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        self._pending_confirmation = None
 
     def get_audit_summary(self) -> dict:
-        """获取本次会话的审计摘要"""
         return audit_logger.get_stats()
 
     def get_recent_logs(self, n: int = 10) -> list[dict]:
-        """获取最近的工具调用日志"""
         return audit_logger.get_recent_logs(n)

@@ -89,9 +89,9 @@ def set_result(key: str, result: dict[str, Any]):
 def is_idempotent_tool(tool_name: str) -> bool:
     """判断工具是否需要幂等保护"""
     # 写操作都需要幂等保护，只读操作不需要
-    from tool_registry import get_permission, PermissionLevel
+    from tool_registry import get_permission
     perm = get_permission(tool_name)
-    return perm in (PermissionLevel.WRITE, PermissionLevel.DELETE, PermissionLevel.PAYMENT)
+    return perm in ("write", "delete", "payment")
 
 
 def cleanup_expired(ttl: int = IDEMPOTENCY_TTL):

@@ -2,39 +2,38 @@
 退款政策 RAG 查询工具
 
 📖 核心概念：
-    完整的三步 RAG 链路：
-    1. Chunking — 把退款政策文档切成小块（防止过长文本损失检索精度）
-    2. Embedding — 每个 chunk → 向量（千问 text-embedding-v3，1024维）
-    3. 检索 — 用户问题 → 向量化 → Chroma 语义搜索 → 最相关 chunk → 返回 LLM
+    完整 RAG 链路：
+    1. Chunking — 递归字符切分 + overlap
+    2. Embedding — 千问 text-embedding-v3（1024 维）
+    3. 检索 — MultiQueryRetriever（LangChain）生成多个变体 → 语义搜索 → 去重合并
 
-🔍 底层原理（ChromaDB 语义搜索）：
-    用户问"无理由退货有什么条件？"
-      → Embedding API 生成查询向量 q
-      → Chroma 在所有文档向量 {d1, d2, ...} 中找 cosine_sim(q, di) 最大的 top_k 个
-      → 返回最相关的文档片段
+🔍 MultiQueryRetriever vs 手写单次搜索：
 
-💡 与关键词匹配的区别：
-    关键词匹配："7天"命中 → 返回"7天无理由退货"段落（精确匹配）
-    语义搜索："无条件退货" → 也返回"7天无理由退货"段落（理解语义，不一定匹配原词）
+    手写：
+      query="那要多久" → 1 次搜索 → Chroma 返回 top 3
 
-    这就是 RAG 的价值——用户可能用各种说法问同一个问题，
-    语义搜索能找到正确的答案，不管用词是否完全一致。
+    MultiQueryRetriever（LangChain）：
+      query="那要多久"
+        → LLM 生成 3 个变体：
+          "退款需要多长时间"
+          "退款到账时效是多久"
+          "退货退款处理需要几个工作日"
+        → 3 次搜索，各返回 top 3
+        → 合并去重，取 top_k 条
+    覆盖面更广，命中率更高。
 
-⚠️ 开发技巧：
-    这里不用 ChromaDB 内置的 Embedding（它默认下载一个 79MB 的模型），
-    而是手动调用千问 Embedding API 生成向量，再用 collection.add(embeddings=...) 存入。
-    好处：
-    - 不触发额外模型下载
-    - 可控、可观测（你能看到每个 chunk 的向量维度和检索结果）
-    - 面试时能讲清"Embedding → 存储 → 检索"每一步
+💡 为什么用 LangChain 而不是手写：
+    - rewrite_query：手写 raw API call → 用 ChatPromptTemplate | LLM 管道（代码更短、更可读）
+    - 搜索：手写单 query 搜索 → 用 MultiQueryRetriever（覆盖多角度，效果更好）
+    - 面试时可以说"我理解底层原理，但工程上用成熟库更可靠"
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import List
 
-# 确保能找到项目根目录的 config
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import chromadb
@@ -46,7 +45,7 @@ from config import RAG_CHROMA_PATH, LLM_CONFIG
 # ============================================================
 # Embedding 配置 — 用千问 text-embedding-v3
 # ============================================================
-EMBEDDING_MODEL = "text-embedding-v3"  # 1024 维，效果好
+EMBEDDING_MODEL = "text-embedding-v3"
 
 _embedding_client = OpenAI(
     api_key=LLM_CONFIG["api_key"],
@@ -54,9 +53,25 @@ _embedding_client = OpenAI(
 )
 
 COLLECTION_NAME = "refund_policy"
-CHUNK_SIZE = 300       # 每个 chunk 的目标字符数（政策文档比较短，300 够了）
-CHUNK_OVERLAP = 50     # chunk 之间的重叠（防止关键信息在边界被切断）
-TOP_K = 3              # 检索召回数
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
+TOP_K = 3
+
+# ============================================================
+# LangChain 组件（延迟初始化，首次 search 时才创建）
+# ============================================================
+
+_langchain_llm = None       # ChatOpenAI 实例
+_multi_retriever = None     # MultiQueryRetriever 实例
+
+# 对话上下文（可选注入，用于 context-aware rewrite）
+_context: str = ""
+
+
+def set_search_context(text: str):
+    """Agent 可选注入对话上下文（用于补全指代）"""
+    global _context
+    _context = text
 
 
 # ============================================================
@@ -110,214 +125,270 @@ REFUND_POLICY_DOC = """
 
 
 # ============================================================
-# Chunking — 把长文档切成小块
+# Chunking — 用 LangChain RecursiveCharacterTextSplitter
 # ============================================================
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """
-    递归字符切分（Recursive Character Splitter）。
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-    📖 原理：
-        按优先级从高到低尝试分隔符，尽量保持语义单元完整。
-        然后在 chunk 之间加 overlap，防止关键信息正好在切分边界被切断。
-
-        比如："...退回运费由买家承担。"
-              "如因商品质量问题导致的退货..."
-        如果正好在句号后切断，第二句开头"如因商品质量..."缺少上下文。
-        加了 overlap 后，第二个 chunk 也会包含前一个 chunk 最后几个句子。
-    """
-    separators = ["\n## ", "\n### ", "\n\n", "\n", "。", "；", "，", ". ", " "]
-    chunks = _recursive_split(text, separators, chunk_size, overlap)
-    return chunks
+_chunk_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    separators=["\n## ", "\n### ", "\n\n", "\n", "。", "；", "，", ". ", " "],
+    keep_separator=False,
+)
 
 
-def _recursive_split(text: str, separators: List[str], chunk_size: int, overlap: int) -> List[str]:
-    """递归切分核心逻辑"""
-    # 如果当前文本不超过 chunk_size，直接返回
-    if len(text) <= chunk_size:
-        return [text] if text.strip() else []
-
-    # 尝试用当前优先级最高的分隔符切分
-    sep = separators[0] if separators else " "
-    splits = text.split(sep)
-
-    # 如果只有一个片段（即分隔符未命中），换下一个分隔符
-    if len(splits) == 1 and len(separators) > 1:
-        return _recursive_split(text, separators[1:], chunk_size, overlap)
-
-    chunks = []
-    current_chunk = ""
-
-    for split in splits:
-        candidate = (current_chunk + sep + split).strip() if current_chunk else split
-
-        if len(candidate) <= chunk_size:
-            current_chunk = candidate
-        else:
-            # 当前 chunk 已满，保存并开始新 chunk
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            # 如果单个片段超过 chunk_size，递归切它
-            if len(split) > chunk_size:
-                sub_chunks = _recursive_split(split, separators[1:] if len(separators) > 1 else [" "], chunk_size, overlap)
-                chunks.extend(sub_chunks)
-                current_chunk = ""
-            else:
-                current_chunk = split
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    # 加 overlap：每个 chunk 后面接上一个 chunk 的尾巴
-    if overlap > 0 and len(chunks) > 1:
-        overlapped = [chunks[0]]
-        for i in range(1, len(chunks)):
-            tail = chunks[i - 1][-overlap:] if len(chunks[i - 1]) > overlap else chunks[i - 1]
-            overlapped.append(tail + chunks[i])
-        chunks = overlapped
-
-    return chunks
+def chunk_text(text: str) -> List[str]:
+    """用 LangChain RecursiveCharacterTextSplitter 切分文档"""
+    docs = _chunk_splitter.create_documents([text])
+    return [doc.page_content for doc in docs]
 
 
 # ============================================================
-# Embedding — 用千问 API 把文本变成向量
+# Embedding — 千问 text-embedding-v3
 # ============================================================
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    批量文本 → 向量。
-
-    原理：对每条文本调 Embedding API，返回一个 1024 维的浮点数列表。
-    这些数字在 1024 维空间中代表文本的语义位置。
-    """
     if not texts:
         return []
-
-    # 千问 Embedding API 限制：单次最多传 25 条
     batch_size = 20
     all_embeddings = []
-
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        resp = _embedding_client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=batch,
-        )
+        resp = _embedding_client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
         all_embeddings.extend([item.embedding for item in resp.data])
-
     return all_embeddings
 
 
 def embed_single(text: str) -> List[float]:
-    """单条文本向量化"""
     return embed_texts([text])[0]
 
 
 # ============================================================
-# ChromaDB 存储 + 检索
+# LangChain 适配：ChromaDB → BaseRetriever
+# ============================================================
+
+def _get_langchain_llm():
+    """延迟初始化 ChatOpenAI（避免 import 报错）"""
+    global _langchain_llm
+    if _langchain_llm is None:
+        from langchain_openai import ChatOpenAI
+        _langchain_llm = ChatOpenAI(
+            model=LLM_CONFIG["model"],
+            openai_api_key=LLM_CONFIG["api_key"],
+            openai_api_base=LLM_CONFIG["base_url"],
+            temperature=0,
+        )
+    return _langchain_llm
+
+
+class ChromaRetriever:
+    """
+    ChromaDB → LangChain Retriever 适配器。
+
+    LangChain 的 MultiQueryRetriever 需要一个 BaseRetriever 作为底层搜索引擎。
+    这个适配器把我们的 ChromaDB 向量搜索包装成 LangChain 认识的接口。
+    """
+
+    # 不需要继承 BaseRetriever，MultiQueryRetriever 接受任何有 invoke/get_relevant_documents 的对象
+
+    def __init__(self, collection, top_k: int = TOP_K):
+        self.collection = collection
+        self.top_k = top_k
+
+    def get_relevant_documents(self, query: str) -> list:
+        """LangChain 标准接口：query → List[Document]"""
+        from langchain_core.documents import Document
+
+        query_vec = embed_single(query)
+        results = self.collection.query(
+            query_embeddings=[query_vec],
+            n_results=self.top_k,
+            include=["documents", "distances"],
+        )
+
+        docs = []
+        if results["documents"] and results["documents"][0]:
+            for i, doc_text in enumerate(results["documents"][0]):
+                distance = results["distances"][0][i] if results["distances"] else 0
+                docs.append(Document(
+                    page_content=doc_text,
+                    metadata={"similarity": max(0, 1.0 - distance)},
+                ))
+        return docs
+
+    def invoke(self, query: str, **kwargs) -> list:
+        """LangChain Runnable 接口"""
+        return self.get_relevant_documents(query)
+
+
+def _get_multi_retriever(collection):
+    """延迟初始化 MultiQueryRetriever"""
+    global _multi_retriever
+    if _multi_retriever is None:
+        from langchain.retrievers.multi_query import MultiQueryRetriever
+
+        base_retriever = ChromaRetriever(collection, top_k=TOP_K)
+        _multi_retriever = MultiQueryRetriever.from_llm(
+            retriever=base_retriever,
+            llm=_get_langchain_llm(),
+        )
+    return _multi_retriever
+
+
+# ============================================================
+# Query Rewrite — 用 LangChain prompt chain（替代手写 raw API）
+# ============================================================
+
+def rewrite_query(query: str, context: str) -> str:
+    """
+    Context-aware Query Rewrite（用 LangChain prompt chain）。
+
+    之前手写版：
+        resp = client.chat.completions.create(model=..., messages=[...])
+        rewritten = resp.choices[0].message.content
+
+    现在用 LangChain：
+        chain = ChatPromptTemplate | LLM | StrOutputParser
+        rewritten = chain.invoke({"context": ..., "question": ...})
+
+    好处：
+    - 不需要手动拼 messages 结构
+    - ChatPromptTemplate 帮你处理 system/user 角色的模板化
+    - 管道符（|）是 LangChain 的 LCEL，可读性强
+    - 自动处理 retry、streaming 等细节
+    """
+    # 不含指代词 → 跳过改写（省钱 + 省时间）
+    if not re.search(r"那|这|它|他|她|呢|吗|啊|吧", query):
+        return query
+
+    try:
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import StrOutputParser
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "你是一个搜索查询优化助手。根据对话上下文，把用户的简短/省略问题"
+             "改写成完整、独立的搜索词。只输出改写后的搜索词，不要加任何解释。"),
+            ("user",
+             "对话上下文：\n{context}\n\n"
+             "用户问题：{question}\n\n"
+             "改写后的搜索词："),
+        ])
+
+        chain = prompt | _get_langchain_llm() | StrOutputParser()
+        rewritten = chain.invoke({"context": context, "question": query})
+        return rewritten.strip() if rewritten else query
+
+    except Exception:
+        return query
+
+
+# ============================================================
+# RAG 引擎（ChromaDB 存储 + LangChain 检索）
 # ============================================================
 
 class RefundPolicyRAG:
     """
     退款政策 RAG 引擎。
 
-    完整的 RAG 三步：
-    1. 首次启动 → chunk → embed → 存入 Chroma
-    2. 每次查询 → query embed → Chroma 语义搜索 → 返回最相关 chunk
+    索引：首次启动 → chunk → embed → 存入 Chroma
+    检索：MultiQueryRetriever（多角度变体搜索 → 去重合并）
     """
 
     def __init__(self):
         self._ensure_data_loaded()
 
     def _ensure_data_loaded(self):
-        """确保 ChromaDB 中有退款政策数据（幂等：已有就不重复加）"""
-        # 确保目录存在
         RAG_CHROMA_PATH.mkdir(parents=True, exist_ok=True)
 
         self.client = chromadb.PersistentClient(
             path=str(RAG_CHROMA_PATH),
             settings=Settings(anonymized_telemetry=False),
         )
-
         self.collection = self.client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
 
-        # 幂等检查：如果已经有数据，跳过导入
         if self.collection.count() > 0:
             print(f"  📚 退款政策已加载（{self.collection.count()} 个 chunk）")
             return
 
-        # 第 1 步：Chunking
         print("  ✂️  正在切分退款政策文档...")
         chunks = chunk_text(REFUND_POLICY_DOC)
         print(f"     切分为 {len(chunks)} 个 chunk")
 
-        # 第 2 步：Embedding
         print(f"  🔤 正在向量化（{EMBEDDING_MODEL}，1024 维）...")
         embeddings = embed_texts(chunks)
         print(f"     完成，共 {len(embeddings)} 个向量")
 
-        # 第 3 步：存入 Chroma
         print(f"  💾 正在存入 ChromaDB（{RAG_CHROMA_PATH}）...")
         ids = [f"chunk_{i}" for i in range(len(chunks))]
-        self.collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=chunks,
-        )
+        self.collection.add(ids=ids, embeddings=embeddings, documents=chunks)
         print(f"  ✅ 退款政策 RAG 知识库构建完成！")
 
     def search(self, query: str, top_k: int = TOP_K) -> str:
         """
-        语义搜索退款政策。
+        检索退款政策。
 
         流程：
-        1. 用户问题 → 向量 q
-        2. Chroma 搜 top_k 最相似的 chunk
-        3. 格式化返回给 LLM
+        ① （如有上下文）LangChain rewrite → 补全指代
+        ② MultiQueryRetriever → 生成多个变体 → 搜索 → 去重合并
+        ③ 格式化返回 JSON
+
+        MultiQueryRetriever 做的事：
+          query="那要多久"
+            → LLM 生成 3 个变体："退款需要多长时间" / "退款到账时效" / ...
+            → 每个变体分别向量搜索
+            → 合并去重，取最相关的 top 条
         """
-        # ⚡ 用 query_embeddings 而非 query_texts（避免触发 Chroma 内置 Embedding 下载）
-        query_vec = embed_single(query)
+        original_query = query
 
-        results = self.collection.query(
-            query_embeddings=[query_vec],
-            n_results=top_k,
-            include=["documents", "distances"],
-        )
+        # ① Context-aware rewrite（用 LangChain prompt chain，替代手写 API call）
+        if _context:
+            rewritten = rewrite_query(query, _context)
+            if rewritten and rewritten != query:
+                query = rewritten
 
-        if not results["documents"] or not results["documents"][0]:
+        # ② MultiQueryRetriever：多角度变体搜索
+        try:
+            retriever = _get_multi_retriever(self.collection)
+            docs = retriever.invoke(query)  # 返回 List[Document]
+        except Exception:
+            # LangChain 不可用时降级为单次搜索
+            docs = ChromaRetriever(self.collection, top_k=top_k).invoke(query)
+
+        if not docs:
             return json.dumps({
                 "status": "no_results",
                 "message": "未找到相关的退款政策，建议联系人工客服确认。",
             }, ensure_ascii=False)
 
-        # 组装检索结果
+        # ③ 格式化返回
         policies = []
-        for i, doc in enumerate(results["documents"][0]):
-            distance = results["distances"][0][i] if results["distances"] else 0
-            similarity = max(0, 1.0 - distance)  # cosine distance → similarity
+        for doc in docs[:top_k]:
+            sim = doc.metadata.get("similarity", 0)
             policies.append({
-                "similarity": f"{similarity:.2%}",
-                "content": doc,
+                "similarity": f"{sim:.2%}" if isinstance(sim, float) else str(sim),
+                "content": doc.page_content[:500],
             })
 
         return json.dumps({
             "status": "found",
             "query": query,
+            "original_query": original_query if original_query != query else None,
             "retrieved_count": len(policies),
             "policies": policies,
         }, ensure_ascii=False)
 
     def get_stats(self) -> dict:
-        """返回知识库统计信息"""
         return {
             "collection_name": COLLECTION_NAME,
             "chunk_count": self.collection.count(),
             "embedding_model": EMBEDDING_MODEL,
             "storage_path": str(RAG_CHROMA_PATH),
+            "retriever": "MultiQueryRetriever (LangChain)",
         }
 
 
@@ -329,7 +400,6 @@ _rag_engine: RefundPolicyRAG | None = None
 
 
 def get_rag_engine() -> RefundPolicyRAG:
-    """延迟初始化（首次启动时自动构建知识库）"""
     global _rag_engine
     if _rag_engine is None:
         print("  🚀 初始化退款政策 RAG 引擎...")
@@ -338,7 +408,6 @@ def get_rag_engine() -> RefundPolicyRAG:
 
 
 def ensure_refund_policy_data():
-    """返回完整退款政策文本（供 tool_registry 降级使用）"""
     return REFUND_POLICY_DOC
 
 
@@ -348,22 +417,16 @@ def ensure_refund_policy_data():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("🧪 退款政策 RAG 自测")
+    print("🧪 退款政策 RAG 自测（LangChain MultiQueryRetriever）")
     print("=" * 50)
 
-    # 测试 chunking
     chunks = chunk_text(REFUND_POLICY_DOC)
     print(f"\n📐 Chunking: {len(chunks)} 个片段")
-    for i, c in enumerate(chunks):
-        print(f"  [{i}] {c[:80]}...")
 
-    # 测试 embedding
     print("\n🔤 Embedding 测试...")
     vec = embed_single("7天无理由退货的条件是什么")
     print(f"  向量维度: {len(vec)}")
-    print(f"  前5个值: {vec[:5]}")
 
-    # 测试 RAG 引擎
     print("\n🔍 检索测试：")
     rag = RefundPolicyRAG()
 
