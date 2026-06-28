@@ -185,7 +185,7 @@ def get_high_risk_executor(tool_name: str):
 
 
 # ═══════════════════════════════════════════════════════════
-# Tool Routing（保留 — LangChain 没有内置等价功能）
+# Tool Routing — 关键词（快）+ LLM 语义（准）两层兜底
 # ═══════════════════════════════════════════════════════════
 
 import re
@@ -201,18 +201,90 @@ ROUTING_PATTERNS = {
         r"我要.*退|我要.*换|我要.*取消|帮我.*退|帮我.*换|帮我.*取消",
 }
 
+# LLM 语义分类的 prompt — 只在关键词兜不住时用
+_ROUTING_LLM_PROMPT = """分析用户消息，判断意图属于 "query"（查询信息）还是 "action"（执行操作）。
+
+- query: 查看订单、查物流、咨询政策、了解规则
+- action: 取消订单、申请退款、创建工单、换货
+
+只输出一个词：query 或 action。不要加任何解释。"""
+
+# 缓存 LLM 路由结果（相同 query 不重复调 LLM）
+_routing_cache: dict[str, str] = {}
+
+
+def _llm_route(user_message: str) -> str | None:
+    """用 LLM 做语义意图分类（关键词兜不住时的降级方案）"""
+    # 缓存命中 → 直接返回
+    key = user_message.strip()[:100]
+    if key in _routing_cache:
+        return _routing_cache[key]
+
+    try:
+        # 延迟导入，避免循环依赖
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        import os
+        llm = ChatOpenAI(
+            model=os.getenv("LLM_MODEL", "qwen-plus"),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_api_base=os.getenv(
+                "OPENAI_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            temperature=0,
+        )
+        resp = llm.invoke([
+            SystemMessage(content=_ROUTING_LLM_PROMPT),
+            HumanMessage(content=user_message),
+        ])
+        result = (resp.content or "").strip().lower()
+        if result in ("query", "action"):
+            _routing_cache[key] = result
+            return result
+    except Exception:
+        pass
+
+    return None
+
 
 def route_tools(user_message: str, verbose: bool = False) -> list:
-    """意图分类 → 缩小发给 LLM 的工具集"""
+    """
+    意图路由：第一层关键词（零成本），第二层 LLM 语义（兜底）。
+
+    流程：
+    1. 关键词正则命中 → 直接返回对应工具集
+    2. 关键词没命中 → LLM 语义判断 → 返回对应工具集
+    3. LLM 也失败 → 兜底返回全部工具
+    """
+    if not user_message or not user_message.strip():
+        return ALL_TOOLS
+
+    # 第一层：关键词匹配（快，零成本）
     for category, pattern in ROUTING_PATTERNS.items():
         if re.search(pattern, user_message):
             narrowed = QUERY_TOOLS if category == "query" else ACTION_TOOLS
             if verbose:
-                print(f"  🎯 Tool Routing: 意图={category} → "
-                      f"发送 {len(narrowed)}/{len(ALL_TOOLS)} 个工具")
+                print(f"  🎯 Tool Routing（关键词）: {category} → "
+                      f"{len(narrowed)}/{len(ALL_TOOLS)} 个工具")
             return narrowed
+
+    # 第二层：LLM 语义兜底（慢但准，只在关键词兜不住时触发）
     if verbose:
-        print(f"  🎯 Tool Routing: 意图未识别 → 发送全部 {len(ALL_TOOLS)} 个工具")
+        print(f"  🤔 Tool Routing（关键词未命中）→ LLM 语义判断...")
+
+    llm_category = _llm_route(user_message)
+    if llm_category:
+        narrowed = QUERY_TOOLS if llm_category == "query" else ACTION_TOOLS
+        if verbose:
+            print(f"  🎯 Tool Routing（LLM 语义）: {llm_category} → "
+                  f"{len(narrowed)}/{len(ALL_TOOLS)} 个工具")
+        return narrowed
+
+    # 第三层：全部兜底
+    if verbose:
+        print(f"  🎯 Tool Routing: 全部 {len(ALL_TOOLS)} 个工具（兜底）")
     return ALL_TOOLS
 
 

@@ -1,6 +1,6 @@
 # 🤖 多工具智能客服 Agent
 
-基于 LangChain + OpenAI Function Calling 的智能客服系统，集成 **6 个工具**（订单查询、物流追踪、退款政策 RAG、工单创建、订单取消），实现 **7 项生产级特性**（Tool Routing + 权限分级 + 幂等 + 重试 + Human-in-the-Loop + 审计日志 + 参数校验）。
+基于 LangChain + OpenAI Function Calling 的智能客服系统，集成 **6 个工具**，实现 **9 项生产级特性**（Tool Routing 三层路由 + tool_choice 动态策略 + 无依赖并行执行 + 权限分级 + 幂等 + 重试 + Human-in-the-Loop + 审计日志 + 参数校验）。
 
 ---
 
@@ -30,13 +30,15 @@
 │    HumanMessage / ToolMessage → 消息格式标准化               │
 │                                                              │
 │  自定义层负责（生产特性）：                                    │
-│    ① Tool Routing — 意图分类，缩小工具集                     │
-│    ② Pydantic 参数校验                                      │
-│    ③ Permission 检查 — read/write/delete/payment 四级        │
-│    ④ Idempotency — 幂等键防重复操作                          │
-│    ⑤ Retry Policy — tenacity 指数退避，区分可/不可重试       │
-│    ⑥ Human-in-the-Loop — 高风险需用户确认                    │
-│    ⑦ Audit Log — JSONL 全记录                               │
+│    ① Tool Routing — 关键词 + LLM 语义 + 兜底，三层路由        │
+│    ② tool_choice — 根据业务状态动态设置（auto/required/强制） │
+│    ③ 并行执行 — 同轮多 tool_call → ThreadPoolExecutor 并发   │
+│    ④ Pydantic 参数校验                                      │
+│    ⑤ Permission 检查 — read/write/delete/payment 四级        │
+│    ⑥ Idempotency — 幂等键防重复操作                          │
+│    ⑦ Retry Policy — tenacity 指数退避，区分可/不可重试       │
+│    ⑧ Human-in-the-Loop — 高风险需用户确认                    │
+│    ⑨ Audit Log — JSONL 全记录                               │
 └──────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -140,13 +142,19 @@ python main.py --once "我想退货，有什么条件？"
 # 6. 口语化政策查询（测试语义理解 + Query Rewrite）
 python main.py --once "我刚买了双鞋穿着小了想换个大的，怎么操作？"
 
-# 7. 创建售后工单
+# 7. 并行执行（同时查两个订单）
+python main.py --once "帮我同时查ORD-0001和ORD-0002的订单"
+
+# 8. LLM 语义路由（关键词未命中时的语义兜底）
+python main.py --once "帮我把那个单子作废"
+
+# 9. 创建售后工单
 python main.py --once "ORD-0004收到的东西坏了，我要投诉"
 
-# 8. 参数校验（非法订单号会被 Pydantic 拦截）
+# 10. 参数校验（非法订单号会被 Pydantic 拦截）
 python main.py --once "帮我查订单号是abc的订单"
 
-# 9. 审计日志
+# 11. 审计日志
 python main.py --audit
 ```
 
@@ -212,15 +220,25 @@ retry_decorator = retry(
 
 不重复造轮子。可重试错误白名单：网络超时 / 503 / 限流 → 重试；参数错误 / 余额不足 → 立即失败。
 
-### ⑤ Tool Routing（意图分类缩小工具集）
+### ⑤ Tool Routing（三层路由：关键词 → LLM 语义 → 兜底）
+
+第一层关键词（零成本，匹配 QUERY vs ACTION），兜不住时第二层 LLM 语义分类（有缓存），两层都失败才发全部工具。
 
 ```
-"查一下 ORD-0001" → 只发 4 个查询工具（精准）
-"我要取消订单"   → 只发 2 个操作工具（精准）
-"你好"          → 发全部 6 个（防误杀）
+"查ORD-0001"     → 关键词命中 → 4 个查询工具
+"帮我把单子作废"  → 关键词未命中 → LLM 语义判断 → action → 2 个操作工具
+"hello"          → 兜底 → 全部 6 个工具
 ```
 
-### ⑥ Permission（读/写/删/支付 四级权限）
+### ⑥ tool_choice（根据业务状态动态设置）
+
+不是写死的 if/else——根据当前对话状态决定：用户已确认高风险操作时强制指定工具名，工具集缩小到 1 个时用 `required` 不准闲聊，其余 `auto` 让 LLM 自主决定。
+
+### ⑦ 并行执行（同轮多 tool_call 并发）
+
+LLM 同一轮返回多个 tool_calls = 判定无依赖 → `ThreadPoolExecutor` 并发执行。跨轮 Agent 循环天然串行处理有依赖场景。依赖关系不需要代码显式判断——LLM 已经分好了。
+
+### ⑧ Permission（读/写/删/支付 四级权限）
 
 | 权限 | 示例工具 | 执行策略 |
 |------|---------|---------|
@@ -229,7 +247,7 @@ retry_decorator = retry(
 | 🗑️ delete | cancel_order | 需用户二次确认 |
 | 💰 payment | （预留） | 需二次确认 + 金融级幂等 |
 
-### ⑦ Human-in-the-Loop + Idempotency
+### ⑨ Human-in-the-Loop + Idempotency
 
 - 高风险操作 → 暂停 → 用户输入"确认" → 才执行
 - 写操作 → 幂等键 = MD5(tool_name + params) → 命中则返回缓存结果
@@ -241,9 +259,12 @@ retry_decorator = retry(
 | 模块 | 怎么说 |
 |------|--------|
 | **工具定义** | 用 LangChain `@tool` 装饰器，type hints + docstring 自动生成 Function Calling Schema |
-| **Agent 循环** | `ChatOpenAI.bind_tools()` + `invoke()`，LangChain 做 LLM 交互 + 消息格式；自己封装 Tool Routing / 幂等 / 重试 / 审计 |
+| **Agent 循环** | `ChatOpenAI.bind_tools()` + `invoke()`，LangChain 做 LLM 交互 + 消息格式；自己封装 Tool Routing / 并行 / 幂等 / 重试 / 审计 |
+| **Tool Routing** | 三层路由——关键词（零成本）→ LLM 语义分类（兜底）→ 全部工具（防误杀），LLM 结果有缓存 |
+| **tool_choice** | 根据业务状态动态设置——确认后强制指定工具名，单工具集用 required 不准闲聊，其余 auto |
+| **并行/串行** | 同轮多 tool_call → `ThreadPoolExecutor` 并发；跨轮 Agent 循环天然串行；依赖关系 LLM 自己判断 |
 | **RAG** | `RecursiveCharacterTextSplitter` 切分 + `MultiQueryRetriever` 多角度变体搜索 + `ChatPromptTemplate` pipe 做 Query Rewrite |
-| **重试** | `tenacity` 库，白名单策略 + 指数退避，不是所有错误都重试 |
+| **重试** | `tenacity` 库，白名单策略 + 指数退避，LLM 调用和工具执行两层都包了 |
 | **幂等** | 写操作自动带幂等键，网络超时重试不会重复创建 |
 | **权限** | 每个工具的元数据声明 permission level，执行时系统统一检查 |
 | **审计** | JSONL 格式全量记录 tool_name / params / result / duration / permission / confirmed |

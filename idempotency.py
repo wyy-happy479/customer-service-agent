@@ -57,7 +57,7 @@ def make_idempotency_key(tool_name: str, params: dict) -> str:
     return f"{tool_name}:{params_hash}"
 
 
-def check_and_set(key: str, ttl: int = IDEMPOTENCY_TTL) -> dict[str, Any] | None:
+def get_if_exists(key: str, ttl: int = IDEMPOTENCY_TTL) -> dict[str, Any] | None:
     """
     检查幂等键是否已存在。
 
@@ -131,6 +131,6 @@ if __name__ == "__main__":
     print(f"key 不同? {'✅' if key1 != key3 else '❌'}")
 
     # 幂等检查
-    print(f"\n首次检查 '{key1}': {check_and_set(key1)}")   # None → 第一次
+    print(f"\n首次检查 '{key1}': {get_if_exists(key1)}")   # None → 第一次
     set_result(key1, {"success": True, "ticket_id": "TK-0099"})
-    print(f"二次检查 '{key1}': {check_and_set(key1)}")   # 有结果 → 幂等命中
+    print(f"二次检查 '{key1}': {get_if_exists(key1)}")   # 有结果 → 幂等命中
