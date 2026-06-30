@@ -81,13 +81,16 @@ python main.py
 # 单次查询
 python main.py --once "ORD-0001的快递到哪了？"
 
-# 重新初始化数据库
-python main.py --init-db
-
 # 查看审计日志
 python main.py --audit
 
-# Web 界面（可选）
+# 重置数据库（恢复初始模拟数据）
+python .claude/skills/customer-service/scripts/reset_db.py
+
+# 工具自检
+python .claude/skills/customer-service/scripts/check_tools.py
+
+# Web 界面
 streamlit run app.py
 ```
 
@@ -95,31 +98,85 @@ streamlit run app.py
 
 ```
 03-customer-service-agent/
-├── main.py                   # CLI 入口
-├── app.py                    # Streamlit Web UI（可选）
-├── agent.py                  # ★ 核心引擎：LangChain bind_tools + 7 项生产特性
-├── tool_registry.py          # 工具注册表（LangChain @tool 装饰器）
-├── database.py               # SQLite 数据库（订单/物流/工单）
-├── validation.py             # Pydantic 参数校验
-├── idempotency.py            # 幂等机制（防重复操作）
-├── retry.py                  # 重试策略（tenacity 库）
-├── audit.py                  # 审计日志（JSONL）
-├── config.py                 # 全局配置
-├── requirements.txt          # 依赖清单
-├── .env.example              # 环境变量模板
-├── .gitignore                # Git 忽略规则
-├── README.md                 # 本文件
-├── data/
-│   ├── customer_service.db   # SQLite 数据库文件（自动生成）
-│   ├── audit_log.jsonl       # 审计日志（自动生成）
-│   └── chroma_rag/           # 退款政策 RAG 知识库（首次启动自动构建）
-└── tools/
-    ├── order_tools.py        # 订单查询
-    ├── logistics_tools.py    # 物流追踪
-    ├── refund_policy_tools.py # 退款政策 RAG (LangChain RecursiveTextSplitter + MultiQueryRetriever)
-    ├── ticket_tools.py       # 工单创建
-    └── cancel_order_tools.py # 取消订单（高风险确认）
+├── main.py                      # CLI 入口（交互模式 + 单次查询 + 审计日志）
+├── app.py                       # Streamlit Web UI
+├── agent.py                     # ★ Agent 核心引擎：LangChain bind_tools + 9 项生产特性
+├── tool_registry.py             # 工具注册表（@tool 装饰器 + 路由 + 元数据）
+├── database.py                  # SQLite 数据访问层（订单/物流/工单模拟库）
+├── validation.py                # Pydantic 参数校验
+├── idempotency.py               # 幂等机制（防重复操作）
+├── retry_policy.py              # tenacity 重试策略
+├── audit.py                     # JSONL 审计日志
+├── config.py                    # 集中配置管理
+├── requirements.txt             # 依赖清单
+├── .env.example                 # 环境变量模板
+├── .gitignore
+├── README.md                    # 本文件
+│
+├── tools/                       # 工具实现层
+│   ├── order_tools.py           # 订单查询
+│   ├── logistics_tools.py       # 物流追踪
+│   ├── refund_policy_tools.py   # RAG：RecursiveTextSplitter + MultiQueryRetriever
+│   ├── ticket_tools.py          # 工单创建
+│   └── cancel_order_tools.py    # 取消订单（高风险确认）
+│
+├── .claude/skills/customer-service/  ← Skill 文件夹
+│   ├── SKILL.md                 # Skill 规格说明（触发条件 + 工具链 + 输出模板）
+│   ├── scripts/
+│   │   ├── check_tools.py       # 工具可用性自检
+│   │   └── reset_db.py          # 重置数据库 + RAG 索引
+│   ├── references/
+│   │   ├── database_schema.md   # 数据库表结构文档
+│   │   └── refund_policy.md     # 退款政策 RAG 源文档
+│   ├── templates/
+│   │   └── response_templates.md # 回复模板 + 状态映射
+│   └── assets/
+│       └── config_reference.md  # 全部配置项速查
+│
+└── data/                         # 运行时数据（不提交 Git）
+    ├── customer_service.db       # SQLite 数据库（自动生成）
+    ├── chroma_rag/               # ChromaDB 向量存储（首次启动自动构建）
+    └── audit_log.jsonl           # 审计日志（自动生成）
 ```
+
+## 🧩 Skill 使用（Claude Code 集成）
+
+项目包含了完整的 Claude Code Skill 定义（`.claude/skills/customer-service/SKILL.md`），让 Claude Code 能直接驱动这个客服系统。
+
+### Skill 结构
+
+```
+.claude/skills/customer-service/
+├── SKILL.md             ← Skill 规格说明：触发条件 + 工具链 + 输出模板 + 执行机制
+├── scripts/             ← 可执行辅助脚本
+├── references/          ← 参考资料（数据库 Schema、退款政策源文档）
+├── templates/           ← 回复模板（8 种场景 + 状态映射）
+└── assets/              ← 配置速查表
+```
+
+### Skill 的工作方式
+
+1. **会话开始时** — system prompt 注入 Skill 的 name + description（几十 token）
+2. **用户消息匹配触发条件** — SKILL.md 全文注入 system prompt
+3. **LLM 根据 SKILL.md 的指引** — 知道什么场景用什么工具、如何格式化回复
+4. **工具执行** — 通过 MCP Server（推荐）或 CLI 命令操作数据
+
+详细机制见 [SKILL.md](.claude/skills/customer-service/SKILL.md)「执行机制」章节。
+
+### 辅助脚本
+
+```bash
+# 工具自检：逐一测试每个 Tool 的可用性
+python .claude/skills/customer-service/scripts/check_tools.py
+
+# 只测指定工具
+python .claude/skills/customer-service/scripts/check_tools.py --tool query_order
+
+# 重置数据库 + RAG 索引（恢复初始模拟数据）
+python .claude/skills/customer-service/scripts/reset_db.py
+```
+
+---
 
 ## 🧪 测试用例
 
